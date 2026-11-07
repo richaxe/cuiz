@@ -1,0 +1,110 @@
+name: Publish release
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Copy the latest interviewly release
+        env:
+          INTERVIEWLY_TOKEN: ${{ secrets.INTERVIEWLY_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$INTERVIEWLY_TOKEN" ]; then
+            echo "Add the INTERVIEWLY_TOKEN secret with read access to richaxe/interviewly."
+            exit 1
+          fi
+
+          node <<'NODE'
+          const { execFileSync } = require("node:child_process")
+          const fs = require("node:fs")
+          const path = require("node:path")
+
+          const source = "richaxe/interviewly"
+          const target = "richaxe/cuiz"
+          const token = process.env.INTERVIEWLY_TOKEN
+
+          async function sourceApi(url, accept = "application/vnd.github+json") {
+            const response = await fetch(url, {
+              headers: {
+                Authorization: `Bearer ${token}`,
+                Accept: accept,
+                "X-GitHub-Api-Version": "2022-11-28",
+              },
+              redirect: "follow",
+            })
+            return response
+          }
+
+          function gh(args) {
+            execFileSync("gh", args, { stdio: "inherit" })
+          }
+
+          async function main() {
+            const response = await sourceApi(`https://api.github.com/repos/${source}/releases/latest`)
+            if (response.status === 404) {
+              console.log("No published release on interviewly yet.")
+              return
+            }
+            if (!response.ok) {
+              console.error(`Could not read the interviewly release (HTTP ${response.status}).`)
+              process.exit(1)
+            }
+            const release = await response.json()
+            const tag = release.tag_name || ""
+            if (!/^v\d+\.\d+\.\d+/.test(tag)) {
+              console.error(`Latest interviewly release ${tag} is not a version tag.`)
+              process.exit(1)
+            }
+
+            const assets = (release.assets || []).filter((asset) => {
+              return asset.name !== "builder-debug.yml" && asset.name !== "builder-effective-config.yaml"
+            })
+            if (assets.length === 0) {
+              console.log(`${tag} has no release files yet.`)
+              return
+            }
+
+            const dir = path.join(process.cwd(), "release-assets")
+            fs.mkdirSync(dir, { recursive: true })
+            for (const asset of assets) {
+              const download = await sourceApi(asset.url, "application/octet-stream")
+              if (!download.ok) {
+                console.error(`Could not download ${asset.name} (HTTP ${download.status}).`)
+                process.exit(1)
+              }
+              fs.writeFileSync(path.join(dir, asset.name), Buffer.from(await download.arrayBuffer()))
+              console.log(`Downloaded ${asset.name}`)
+            }
+
+            const notes = path.join(process.cwd(), "release-notes.md")
+            fs.writeFileSync(notes, release.body || `Cuiz ${tag.slice(1)}`)
+            const title = release.name || `Cuiz ${tag.slice(1)}`
+            const files = assets.map((asset) => path.join(dir, asset.name))
+            let exists = true
+            try {
+              execFileSync("gh", ["release", "view", tag, "--repo", target], { stdio: "ignore" })
+            } catch {
+              exists = false
+            }
+            if (!exists) {
+              gh(["release", "create", tag, "--repo", target, "--title", title, "--notes-file", notes, "--latest", ...files])
+            } else {
+              gh(["release", "upload", tag, "--repo", target, "--clobber", ...files])
+              gh(["release", "edit", tag, "--repo", target, "--title", title, "--notes-file", notes, "--draft=false", "--prerelease=false", "--latest"])
+            }
+            console.log(`Published ${tag} to ${target}.`)
+          }
+
+          main().catch((error) => {
+            console.error(error instanceof Error ? error.message : String(error))
+            process.exit(1)
+          })
+          NODE
